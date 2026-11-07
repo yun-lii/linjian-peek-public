@@ -35,6 +35,8 @@ public class CompanionService extends Service {
     private static final String REMINDER_CHANNEL_ID = "linjian_peek_heads_up_v3";
     private static final int NOTIFICATION_ID = 20260715;
     private static final int HOME_MODE_NOTIFICATION_ID = 20260913;
+    // 看门狗阈值：轮询循环超过这么久没有任何一轮跑完，就认为线程卡死
+    private static final long WATCHDOG_STALE_MS = 90000L;
     private static volatile boolean running = false;
 
     private String serverUrl;
@@ -43,6 +45,9 @@ public class CompanionService extends Service {
     private HandlerThread pollThread;
     private long rateLimitedUntilMs = 0L;
     private static long lastStateUploadMs = 0L;
+    private volatile long lastCycleAtMs = 0L;
+    private volatile int loopGen = 1;
+    private Thread watchdogThread;
 
     public static boolean isRunning() { return running; }
     @Override public IBinder onBind(Intent intent) { return null; }
@@ -75,10 +80,46 @@ public class CompanionService extends Service {
         pollHandler = new Handler(pollThread.getLooper());
         DebugState.append(this, "前台轮询线程已启动");
         pollHandler.post(this::pollLoop);
+        startWatchdog();
+    }
+
+    // 看门狗（2026-11-07 补）：轮询线程一旦卡在网络读写上就再也不会转回来，而且卡死不会抛异常、
+    // 调试日志一个字都不会留（实测：12:18 状态上报和取命令同时静默 6.9 小时，只能靠服务端时间戳发现）。
+    // 这里用独立线程每 30 秒检查一次"上一轮循环是什么时候"，超过 90 秒没动静就重建轮询线程。
+    private void startWatchdog() {
+        if (watchdogThread != null) return;
+        watchdogThread = new Thread(() -> {
+            while (running) {
+                try { Thread.sleep(30000L); } catch (InterruptedException e) { return; }
+                if (!running) return;
+                long last = lastCycleAtMs;
+                if (last <= 0) continue;
+                long idle = System.currentTimeMillis() - last;
+                if (idle > WATCHDOG_STALE_MS) {
+                    DebugState.append(this, "看门狗：轮询已停 " + (idle / 1000) + " 秒，重建线程");
+                    restartPolling();
+                }
+            }
+        }, "LinjianWatchdog");
+        watchdogThread.setDaemon(true);
+        watchdogThread.start();
+    }
+
+    private void restartPolling() {
+        loopGen++;
+        lastCycleAtMs = System.currentTimeMillis();
+        try { if (pollThread != null) pollThread.getLooper().quitSafely(); } catch (Exception ignored) { }
+        pollThread = new HandlerThread("LinjianUnifiedPoll");
+        pollThread.start();
+        pollHandler = new Handler(pollThread.getLooper());
+        DebugState.append(this, "轮询线程已重建");
+        pollHandler.post(this::pollLoop);
     }
 
     private void pollLoop() {
         if (!running) return;
+        final int myGen = loopGen;
+        lastCycleAtMs = System.currentTimeMillis();
         long now = System.currentTimeMillis();
         long delay = AppPrefs.interval(this);
         try {
@@ -89,8 +130,9 @@ public class CompanionService extends Service {
                 String body = pollServer();
                 if (body != null && body.length() > 0) handleCommandBody(this, body, serverUrl, token);
             }
-        } catch (Exception e) { DebugState.append(this, "轮询异常：" + ScreenshotService.shortMsg(e)); }
-        if (running) pollHandler.postDelayed(this::pollLoop, Math.max(AppPrefs.MIN_POLL_INTERVAL_MS, delay));
+        } catch (Throwable e) { DebugState.append(this, "轮询异常：" + ScreenshotService.shortMsg(e)); }
+        // 代数不一致说明看门狗已经重建过线程，这一轮不要再往新线程里塞一份循环
+        if (running && myGen == loopGen) pollHandler.postDelayed(this::pollLoop, Math.max(AppPrefs.MIN_POLL_INTERVAL_MS, delay));
     }
 
     private String pollServer() throws Exception {
@@ -559,6 +601,9 @@ public class CompanionService extends Service {
 
     private static String postJson(String urlStr, String token, JSONObject obj) throws Exception {
         HttpURLConnection conn = (HttpURLConnection)new URL(urlStr).openConnection(); conn.setRequestMethod("POST"); conn.setRequestProperty("Content-Type", "application/json; charset=utf-8"); conn.setRequestProperty("X-Auth-Token", token); conn.setDoOutput(true);
+        // 2026-11-07 补：这两个超时原来没设，HttpURLConnection 默认 0 = 永远等，
+        // 网络一断线程就永久卡在 write/read 上，整个轮询循环陪葬。
+        conn.setConnectTimeout(10000); conn.setReadTimeout(20000);
         byte[] data = obj.toString().getBytes(StandardCharsets.UTF_8); try (OutputStream os = conn.getOutputStream()) { os.write(data); }
         InputStream is = conn.getResponseCode() >= 400 ? conn.getErrorStream() : conn.getInputStream();
         ByteArrayOutputStream bos = new ByteArrayOutputStream(); if (is != null) { byte[] buf = new byte[1024]; int n; while ((n = is.read(buf)) > 0) bos.write(buf,0,n); }
